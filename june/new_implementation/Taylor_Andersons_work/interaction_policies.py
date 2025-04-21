@@ -1,8 +1,8 @@
 import datetime
+import random
 from .policy import Policy, PolicyCollection
 from june.interaction import Interaction
 from collections import defaultdict
-import random  # Added for random number generation
 
 class InteractionPolicy(Policy):
     policy_type = "interaction"
@@ -67,7 +67,7 @@ class MaskWearing(InteractionPolicy):
         self.beta_factor_female = beta_factor_female if beta_factor_female is not None else beta_factor
         self.mask_probabilities = mask_probabilities
         self.behavioral_model = behavioral_model
-# Behavioral model parameters (based on Anderson's paper)
+        # Behavioral model parameters (based on Anderson's paper)
         self.odds_ratios = {
             "male": 0.437807,
             "white": 0.288743,
@@ -76,7 +76,8 @@ class MaskWearing(InteractionPolicy):
             "vulnerability_high": 3.571090,
             "intercept": 4.540417
         }
-
+        # Track if original transmission function has been saved
+        self._original_transmission_func_saved = False
     
     def calculate_mask_adoption_probability(self, person):
         """
@@ -136,10 +137,16 @@ class MaskWearing(InteractionPolicy):
         
         This method should be called for each person when processing interactions
         """
-        if random.random() < self.compliance:
-            person.mask_wearing = True
+        if self.behavioral_model:
+            # Use behavioral model to determine mask adoption
+            mask_prob = self.calculate_mask_adoption_probability(person)
+            person.wears_mask = random.random() < mask_prob
+        else:
+            # Use standard compliance approach
+            person.wears_mask = random.random() < self.compliance
             
-            # Apply gender-specific mask factor
+        # Apply gender-specific mask factor if wearing mask
+        if person.wears_mask:
             if hasattr(person, 'sex'):
                 if person.sex == "m":
                     person.mask_factor = self.beta_factor_male
@@ -150,5 +157,73 @@ class MaskWearing(InteractionPolicy):
             else:
                 person.mask_factor = self.beta_factor
         else:
-            person.mask_wearing = False
             person.mask_factor = 1.0  # No reduction
+    
+    def apply_to_interaction(self, date: datetime, interaction: Interaction):
+        """
+        Apply mask policy to the interaction module
+        This modifies the interaction module's transmission calculation
+        """
+        if self.start_time <= date <= self.end_time:
+            # Store the original method if not already stored
+            if not self._original_transmission_func_saved:
+                if hasattr(interaction, "_original_calculate_transmission"):
+                    # Already saved by another instance, use that one
+                    pass
+                else:
+                    # Save the original method
+                    interaction._original_calculate_transmission = interaction.calculate_transmission
+                self._original_transmission_func_saved = True
+                
+                # Create a wrapper that applies gender-specific factors
+                def gender_specific_transmission_wrapper(self_interaction, susceptible, infected, group, delta_time, **kwargs):
+                    # Call original method to get base transmission probability
+                    transmission_prob = interaction._original_calculate_transmission(
+                        susceptible, infected, group, delta_time, **kwargs
+                    )
+                    
+                    # If using behavioral model, check if person is wearing mask
+                    if self.behavioral_model:
+                        if hasattr(susceptible, "wears_mask") and susceptible.wears_mask:
+                            if hasattr(susceptible, "sex"):
+                                if susceptible.sex == "m":
+                                    transmission_prob *= self.beta_factor_male
+                                elif susceptible.sex == "f":
+                                    transmission_prob *= self.beta_factor_female
+                                else:
+                                    transmission_prob *= self.beta_factor
+                            else:
+                                transmission_prob *= self.beta_factor
+                    else:
+                        # If not using behavioral model, use standard approach
+                        # Apply reduction based on location and compliance
+                        group_factor = 1.0
+                        if hasattr(group, "spec") and group.spec in self.mask_probabilities:
+                            # Apply gender-specific factors
+                            if hasattr(susceptible, "sex"):
+                                if susceptible.sex == "m":
+                                    group_factor = 1 - (self.mask_probabilities[group.spec] * 
+                                                      self.compliance * (1 - self.beta_factor_male))
+                                elif susceptible.sex == "f":
+                                    group_factor = 1 - (self.mask_probabilities[group.spec] * 
+                                                      self.compliance * (1 - self.beta_factor_female))
+                                else:
+                                    group_factor = 1 - (self.mask_probabilities[group.spec] * 
+                                                      self.compliance * (1 - self.beta_factor))
+                            else:
+                                group_factor = 1 - (self.mask_probabilities[group.spec] * 
+                                                  self.compliance * (1 - self.beta_factor))
+                        
+                        transmission_prob *= group_factor
+                    
+                    return transmission_prob
+                
+                # Replace the original method with our wrapper
+                interaction.calculate_transmission = lambda *args, **kwargs: gender_specific_transmission_wrapper(
+                    interaction, *args, **kwargs
+                )
+        else:
+            # Outside policy period, restore original method if we modified it
+            if self._original_transmission_func_saved and hasattr(interaction, "_original_calculate_transmission"):
+                interaction.calculate_transmission = interaction._original_calculate_transmission
+                self._original_transmission_func_saved = False
